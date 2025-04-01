@@ -19,12 +19,19 @@ type Client struct {
 	conn         *websocket.Conn
 	pc           *webrtc.PeerConnection
 	lastActivity time.Time
+	mu           sync.Mutex // Добавляем мьютекс для безопасной записи
 }
 
 var (
 	clients = make(map[*Client]bool)
 	mutex   = &sync.Mutex{}
 )
+
+func (c *Client) sendJSON(data interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(data)
+}
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -33,21 +40,45 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Println("New WebSocket connection established")
+
 	client := &Client{
 		conn:         conn,
 		lastActivity: time.Now(),
 	}
 
-	// Добавляем клиента
 	mutex.Lock()
 	clients[client] = true
 	mutex.Unlock()
 
-	// Запускаем пинг-понг для проверки соединения
-	go pingPongHandler(client)
+	defer cleanupClient(client)
 
-	defer func() {
-		cleanupClient(client)
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		client.lastActivity = time.Now()
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(client.lastActivity) > 45*time.Second {
+					log.Println("Connection timeout, closing...")
+					cleanupClient(client)
+					return
+				}
+
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					log.Println("Ping error:", err)
+					return
+				}
+			}
+		}
 	}()
 
 	for {
@@ -69,53 +100,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case "offer":
 			handleOffer(client, data["sdp"].(string))
 		case "ice":
-			handleICE(client, data["candidate"].(map[string]interface{}))
-		case "pong":
-			// Обработка pong-сообщения
-			continue
+			candidate := data["candidate"].(map[string]interface{})
+			handleICE(client, candidate)
 		}
-	}
-}
-
-func pingPongHandler(client *Client) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if time.Since(client.lastActivity) > 45*time.Second {
-				log.Println("Connection timeout, closing...")
-				cleanupClient(client)
-				return
-			}
-
-			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Println("Ping error:", err)
-				cleanupClient(client)
-				return
-			}
-		}
-	}
-}
-
-func cleanupClient(client *Client) {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	if _, ok := clients[client]; ok {
-		if client.pc != nil {
-			client.pc.Close()
-		}
-		if client.conn != nil {
-			client.conn.Close()
-		}
-		delete(clients, client)
-		log.Println("Client cleaned up")
 	}
 }
 
 func handleOffer(client *Client, sdp string) {
+	log.Println("Received offer, creating PeerConnection")
+
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -134,7 +127,8 @@ func handleOffer(client *Client, sdp string) {
 		if c == nil {
 			return
 		}
-		if err := client.conn.WriteJSON(map[string]interface{}{
+
+		if err := client.sendJSON(map[string]interface{}{
 			"type":      "ice",
 			"candidate": c.ToJSON(),
 		}); err != nil {
@@ -142,32 +136,17 @@ func handleOffer(client *Client, sdp string) {
 		}
 	})
 
+	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+		log.Printf("ICE Connection State changed: %s\n", s.String())
+	})
+
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("Connection state changed: %s\n", s.String())
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
-			cleanupClient(client)
-		}
+		log.Printf("PeerConnection State changed: %s\n", s.String())
 	})
 
-	dataChannel, err := pc.CreateDataChannel("chat", nil)
-	if err != nil {
+	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
 		log.Println("DataChannel error:", err)
-		return
 	}
-
-	dataChannel.OnOpen(func() {
-		log.Println("DataChannel opened!")
-		if err := dataChannel.Send([]byte("Hello from Go server!")); err != nil {
-			log.Println("Send welcome message error:", err)
-		}
-	})
-
-	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		log.Printf("Received message: %s\n", string(msg.Data))
-		if err := dataChannel.Send([]byte("Echo: " + string(msg.Data))); err != nil {
-			log.Println("Send echo error:", err)
-		}
-	})
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -188,7 +167,7 @@ func handleOffer(client *Client, sdp string) {
 		return
 	}
 
-	if err := client.conn.WriteJSON(map[string]interface{}{
+	if err := client.sendJSON(map[string]interface{}{
 		"type": "answer",
 		"sdp":  answer.SDP,
 	}); err != nil {
@@ -201,23 +180,11 @@ func handleICE(client *Client, candidate map[string]interface{}) {
 		return
 	}
 
-	candidateMap, ok := candidate["candidate"].(map[string]interface{})
-	if !ok {
-		log.Println("Invalid candidate format")
-		return
-	}
-
 	iceCandidate := webrtc.ICECandidateInit{
-		Candidate: candidateMap["candidate"].(string),
-	}
-
-	if sdpMid, ok := candidateMap["sdpMid"].(string); ok {
-		iceCandidate.SDPMid = &sdpMid
-	}
-
-	if sdpMLineIndex, ok := candidateMap["sdpMLineIndex"].(float64); ok {
-		idx := uint16(sdpMLineIndex)
-		iceCandidate.SDPMLineIndex = &idx
+		Candidate:        candidate["candidate"].(string),
+		SDPMid:           stringPtr(candidate["sdpMid"].(string)),
+		SDPMLineIndex:    uint16Ptr(uint16(candidate["sdpMLineIndex"].(float64))),
+		UsernameFragment: stringPtr(candidate["usernameFragment"].(string)),
 	}
 
 	if err := client.pc.AddICECandidate(iceCandidate); err != nil {
@@ -225,15 +192,31 @@ func handleICE(client *Client, candidate map[string]interface{}) {
 	}
 }
 
+func stringPtr(s string) *string { return &s }
+func uint16Ptr(u uint16) *uint16 { return &u }
+
+func cleanupClient(client *Client) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if _, ok := clients[client]; ok {
+		if client.pc != nil {
+			client.pc.Close()
+		}
+		if client.conn != nil {
+			client.conn.Close()
+		}
+		delete(clients, client)
+		log.Println("Client cleaned up")
+	}
+}
+
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Server is healthy"))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("WebRTC Signaling Server"))
 	})
 
 	log.Println("Server starting on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("Server failed:", err)
-	}
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
