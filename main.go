@@ -19,7 +19,7 @@ type Client struct {
 	conn         *websocket.Conn
 	pc           *webrtc.PeerConnection
 	lastActivity time.Time
-	mu           sync.Mutex // Добавляем мьютекс для безопасной записи
+	mu           sync.Mutex
 }
 
 var (
@@ -50,8 +50,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 	clients[client] = true
 	mutex.Unlock()
-
-	defer cleanupClient(client)
 
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -85,6 +83,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
+			cleanupClient(client)
 			return
 		}
 
@@ -98,17 +97,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch data["type"] {
 		case "offer":
+			log.Println("Received offer")
 			handleOffer(client, data["sdp"].(string))
 		case "ice":
 			candidate := data["candidate"].(map[string]interface{})
+			log.Println("Received ICE candidate:", candidate)
 			handleICE(client, candidate)
 		}
 	}
 }
 
 func handleOffer(client *Client, sdp string) {
-	log.Println("Received offer, creating PeerConnection")
-
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -125,23 +124,27 @@ func handleOffer(client *Client, sdp string) {
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
+			log.Println("ICE gathering complete")
 			return
 		}
 
+		candidate := c.ToJSON()
+		log.Println("Sending ICE candidate:", candidate)
+
 		if err := client.sendJSON(map[string]interface{}{
 			"type":      "ice",
-			"candidate": c.ToJSON(),
+			"candidate": candidate,
 		}); err != nil {
-			log.Println("Write ICE candidate error:", err)
+			log.Println("Failed to send ICE candidate:", err)
 		}
 	})
 
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
-		log.Printf("ICE Connection State changed: %s\n", s.String())
+		log.Println("ICE connection state changed:", s)
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("PeerConnection State changed: %s\n", s.String())
+		log.Println("PeerConnection state changed:", s)
 	})
 
 	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
@@ -167,28 +170,38 @@ func handleOffer(client *Client, sdp string) {
 		return
 	}
 
+	log.Println("Sending answer")
 	if err := client.sendJSON(map[string]interface{}{
 		"type": "answer",
 		"sdp":  answer.SDP,
 	}); err != nil {
-		log.Println("Send answer error:", err)
+		log.Println("Failed to send answer:", err)
 	}
 }
 
 func handleICE(client *Client, candidate map[string]interface{}) {
 	if client.pc == nil {
+		log.Println("PeerConnection is nil, ignoring ICE candidate")
 		return
 	}
 
+	// Преобразуем кандидата в правильный формат
 	iceCandidate := webrtc.ICECandidateInit{
-		Candidate:        candidate["candidate"].(string),
-		SDPMid:           stringPtr(candidate["sdpMid"].(string)),
-		SDPMLineIndex:    uint16Ptr(uint16(candidate["sdpMLineIndex"].(float64))),
-		UsernameFragment: stringPtr(candidate["usernameFragment"].(string)),
+		Candidate: candidate["candidate"].(string),
 	}
 
+	// Опциональные поля (проверяем наличие)
+	if sdpMid, ok := candidate["sdpMid"].(string); ok {
+		iceCandidate.SDPMid = &sdpMid
+	}
+	if sdpMLineIndex, ok := candidate["sdpMLineIndex"].(float64); ok {
+		idx := uint16(sdpMLineIndex)
+		iceCandidate.SDPMLineIndex = &idx
+	}
+
+	log.Printf("Adding ICE candidate: %+v", iceCandidate)
 	if err := client.pc.AddICECandidate(iceCandidate); err != nil {
-		log.Println("AddICECandidate error:", err)
+		log.Println("Failed to add ICE candidate:", err)
 	}
 }
 
@@ -202,9 +215,11 @@ func cleanupClient(client *Client) {
 	if _, ok := clients[client]; ok {
 		if client.pc != nil {
 			client.pc.Close()
+			log.Println("PeerConnection closed")
 		}
 		if client.conn != nil {
 			client.conn.Close()
+			log.Println("WebSocket connection closed")
 		}
 		delete(clients, client)
 		log.Println("Client cleaned up")
