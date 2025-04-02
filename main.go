@@ -51,6 +51,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clients[client] = true
 	mutex.Unlock()
 
+	defer cleanupClient(client)
+
+	// Configure ping/pong handlers
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
 		client.lastActivity = time.Now()
@@ -58,6 +61,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	// Start ping ticker
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -67,7 +71,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case <-ticker.C:
 				if time.Since(client.lastActivity) > 45*time.Second {
 					log.Println("Connection timeout, closing...")
-					cleanupClient(client)
 					return
 				}
 
@@ -82,8 +85,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Read error:", err)
-			cleanupClient(client)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Println("Read error:", err)
+			}
 			return
 		}
 
@@ -110,9 +114,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func handleOffer(client *Client, sdp string) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
 			{
 				URLs:           []string{"turn:213.184.249.66:3478"},
 				Username:       "user1",
@@ -139,7 +141,6 @@ func handleOffer(client *Client, sdp string) {
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
-			log.Println("ICE gathering complete")
 			return
 		}
 
@@ -162,6 +163,10 @@ func handleOffer(client *Client, sdp string) {
 		log.Println("PeerConnection state changed:", s)
 	})
 
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Println("Received remote track")
+	})
+
 	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
 		log.Println("DataChannel error:", err)
 	}
@@ -173,9 +178,6 @@ func handleOffer(client *Client, sdp string) {
 		log.Println("SetRemoteDescription error:", err)
 		return
 	}
-
-	// Enable better logging of ICE candidates
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
 
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
@@ -189,15 +191,12 @@ func handleOffer(client *Client, sdp string) {
 	}
 
 	// Wait for ICE gathering to complete
-	<-gatherComplete
-
-	// Get the updated local description with all ICE candidates
-	finalAnswer := pc.LocalDescription()
+	<-webrtc.GatheringCompletePromise(pc)
 
 	log.Println("Sending answer with TURN support")
 	if err := client.sendJSON(map[string]interface{}{
 		"type": "answer",
-		"sdp":  finalAnswer.SDP,
+		"sdp":  pc.LocalDescription().SDP,
 	}); err != nil {
 		log.Println("Failed to send answer:", err)
 	}
