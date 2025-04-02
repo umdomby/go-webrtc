@@ -2,12 +2,13 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v3"
 )
 
 var upgrader = websocket.Upgrader{
@@ -18,7 +19,6 @@ type Client struct {
 	conn *websocket.Conn
 	pc   *webrtc.PeerConnection
 	mu   sync.Mutex
-	dc   *webrtc.DataChannel
 }
 
 var (
@@ -44,7 +44,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clients[client] = true
 	clientsMu.Unlock()
 
-	log.Printf("New WebSocket connection from %s", r.RemoteAddr)
+	log.Printf("New connection from %s", r.RemoteAddr)
+
+	// Настройка таймаутов
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
 
 	defer func() {
 		clientsMu.Lock()
@@ -54,34 +61,42 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if client.pc != nil {
 			client.pc.Close()
 		}
-		log.Printf("Closed connection from %s", r.RemoteAddr)
+		log.Printf("Connection closed from %s", r.RemoteAddr)
 	}()
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	// Пинг-понг для поддержания соединения
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
 
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Read error:", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
+				log.Printf("WebSocket error: %v", err)
+			}
 			return
 		}
 
 		var data map[string]interface{}
 		if err := json.Unmarshal(msg, &data); err != nil {
-			log.Println("JSON unmarshal error:", err)
+			log.Println("JSON decode error:", err)
 			continue
 		}
 
 		switch data["type"] {
 		case "offer":
-			handleOffer(client, data["sdp"].(string))
+			go handleOffer(client, data["sdp"].(string))
 		case "ice":
 			candidate := data["candidate"].(map[string]interface{})
-			handleICE(client, candidate)
-		case "chat":
-			if client.dc != nil && client.dc.ReadyState() == webrtc.DataChannelStateOpen {
-				client.dc.SendText(data["message"].(string))
-			}
+			go handleICE(client, candidate)
 		}
 	}
 }
@@ -89,18 +104,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func handleOffer(client *Client, sdp string) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{
-				URLs:       []string{"turn:213.184.249.66:3478"},
-				Username:   "user1",
-				Credential: "pass1",
-			},
-			{
-				URLs:       []string{"turns:213.184.249.66:5349"},
-				Username:   "user1",
-				Credential: "pass1",
-			},
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
-		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)
@@ -115,41 +120,29 @@ func handleOffer(client *Client, sdp string) {
 		if c == nil {
 			return
 		}
-
-		candidate := c.ToJSON()
-		if err := client.sendJSON(map[string]interface{}{
+		client.sendJSON(map[string]interface{}{
 			"type":      "ice",
-			"candidate": candidate,
-		}); err != nil {
-			log.Println("Failed to send ICE candidate:", err)
-		}
+			"candidate": c.ToJSON(),
+		})
 	})
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("ICE Connection State changed: %s", state.String())
+		log.Printf("ICE state changed: %s", state)
 	})
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Println("Got remote track")
+		log.Printf("Track received: %s", track.Kind())
 	})
 
-	pc.OnDataChannel(func(d *webrtc.DataChannel) {
-		client.dc = d
-		log.Printf("New DataChannel %s %d", d.Label(), d.ID())
-
-		d.OnOpen(func() {
-			log.Printf("Data channel '%s'-'%d' open", d.Label(), d.ID())
-		})
-
-		d.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("Message from DataChannel '%s': %s", d.Label(), string(msg.Data))
-		})
-	})
-
+	// Добавляем транспондеры
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
-		log.Println("AddTransceiverFromKind error:", err)
+		log.Println("AddTransceiver video error:", err)
+	}
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		log.Println("AddTransceiver audio error:", err)
 	}
 
+	// Устанавливаем удаленное описание
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
 		SDP:  sdp,
@@ -158,30 +151,30 @@ func handleOffer(client *Client, sdp string) {
 		return
 	}
 
+	// Создаем ответ
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		log.Println("CreateAnswer error:", err)
 		return
 	}
 
+	// Устанавливаем локальное описание
 	if err := pc.SetLocalDescription(answer); err != nil {
 		log.Println("SetLocalDescription error:", err)
 		return
 	}
 
-	<-webrtc.GatheringCompletePromise(pc)
-
+	// Отправляем ответ
 	if err := client.sendJSON(map[string]interface{}{
 		"type": "answer",
 		"sdp":  pc.LocalDescription().SDP,
 	}); err != nil {
-		log.Println("Failed to send answer:", err)
+		log.Println("Send answer error:", err)
 	}
 }
 
 func handleICE(client *Client, candidate map[string]interface{}) {
 	if client.pc == nil {
-		log.Println("PeerConnection is nil")
 		return
 	}
 
@@ -198,7 +191,7 @@ func handleICE(client *Client, candidate map[string]interface{}) {
 	}
 
 	if err := client.pc.AddICECandidate(iceCandidate); err != nil {
-		log.Println("Failed to add ICE candidate:", err)
+		log.Println("AddICECandidate error:", err)
 	}
 }
 
@@ -206,6 +199,13 @@ func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 
+	server := &http.Server{
+		Addr:              ":8080",
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
 	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal("Server failed:", err)
+	}
 }
