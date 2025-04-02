@@ -110,8 +110,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func handleOffer(client *Client, sdp string) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+			{
+				URLs:           []string{"turn:213.184.249.66:3478"},
+				Username:       "user1",
+				Credential:     "pass1",
+				CredentialType: webrtc.ICECredentialTypePassword,
+			},
+			{
+				URLs:           []string{"turns:213.184.249.66:5349"},
+				Username:       "user1",
+				Credential:     "pass1",
+				CredentialType: webrtc.ICECredentialTypePassword,
+			},
 		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)
@@ -159,6 +174,9 @@ func handleOffer(client *Client, sdp string) {
 		return
 	}
 
+	// Enable better logging of ICE candidates
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		log.Println("CreateAnswer error:", err)
@@ -170,10 +188,16 @@ func handleOffer(client *Client, sdp string) {
 		return
 	}
 
-	log.Println("Sending answer")
+	// Wait for ICE gathering to complete
+	<-gatherComplete
+
+	// Get the updated local description with all ICE candidates
+	finalAnswer := pc.LocalDescription()
+
+	log.Println("Sending answer with TURN support")
 	if err := client.sendJSON(map[string]interface{}{
 		"type": "answer",
-		"sdp":  answer.SDP,
+		"sdp":  finalAnswer.SDP,
 	}); err != nil {
 		log.Println("Failed to send answer:", err)
 	}
@@ -185,12 +209,10 @@ func handleICE(client *Client, candidate map[string]interface{}) {
 		return
 	}
 
-	// Преобразуем кандидата в правильный формат
 	iceCandidate := webrtc.ICECandidateInit{
 		Candidate: candidate["candidate"].(string),
 	}
 
-	// Опциональные поля (проверяем наличие)
 	if sdpMid, ok := candidate["sdpMid"].(string); ok {
 		iceCandidate.SDPMid = &sdpMid
 	}
@@ -204,9 +226,6 @@ func handleICE(client *Client, candidate map[string]interface{}) {
 		log.Println("Failed to add ICE candidate:", err)
 	}
 }
-
-func stringPtr(s string) *string { return &s }
-func uint16Ptr(u uint16) *uint16 { return &u }
 
 func cleanupClient(client *Client) {
 	mutex.Lock()
@@ -229,7 +248,7 @@ func cleanupClient(client *Client) {
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("WebRTC Signaling Server"))
+		w.Write([]byte("WebRTC Signaling Server with TURN support"))
 	})
 
 	log.Println("Server starting on :8080")
